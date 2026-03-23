@@ -1,16 +1,16 @@
 from math import log
-from loguru import logger as loguru_logger
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
-from kornia.utils import create_meshgrid
-from src.utils.plotting import make_matching_figures
-from src.utils.metrics import symmetric_epipolar_distance
-from .geometry import warp_kpts, pose2essential_fundamental, warp_kpts_ada
-
 from kornia.geometry.subpix import dsnt
 from kornia.utils.grid import create_meshgrid
+from loguru import logger as loguru_logger
+
+from src.utils.metrics import symmetric_epipolar_distance
+from src.utils.plotting import make_matching_figures
+
+from .geometry import pose2essential_fundamental, warp_kpts, warp_kpts_ada
+
 
 def static_vars(**kwargs):
     def decorate(func):
@@ -25,7 +25,7 @@ def static_vars(**kwargs):
 @torch.no_grad()
 def mask_pts_at_padded_regions(grid_pt, mask):
     """For megadepth dataset, zero-padding exists in images"""
-    mask = repeat(mask, 'n h w -> n (h w) c', c=2)
+    mask = mask.unsqueeze(-1).expand(-1, -1, -1, 2).reshape(mask.shape[0], -1, 2)
     grid_pt[~mask.bool()] = 0
     return grid_pt
 
@@ -131,8 +131,8 @@ def spvs_coarse(data, config):
     valid_mask0, w_pt0_i = warp_kpts(grid_pt0_i, data['depth0'], data['depth1'], data['T_0to1'], data['K0'], data['K1'])
     valid_mask1, w_pt1_i = warp_kpts(grid_pt1_i, data['depth1'], data['depth0'], data['T_1to0'], data['K1'], data['K0'])
 
-    matchability_map0 = rearrange(valid_mask0, "n (h w) -> n h w", h=h0, w=w0).unsqueeze(1)
-    matchability_map1 = rearrange(valid_mask1, "n (h w) -> n h w", h=h1, w=w1).unsqueeze(1)
+    matchability_map0 = valid_mask0.reshape(N, h0, w0).unsqueeze(1)
+    matchability_map1 = valid_mask1.reshape(N, h1, w1).unsqueeze(1)
     data.update(
         {
             "spv_matchability_map0": matchability_map0,  # [N, 1, h0, w0]
@@ -257,13 +257,13 @@ def spvs_fine(data, config, logger = None):
         data.update({'expec_f_gt': torch.zeros(1, 2, device=device)})
     else:
         grid_pt0_f = create_meshgrid(hf0, wf0, False, device) - W // 2 + 0.5 # [1, hf0, wf0, 2] # use fine coordinates
-        grid_pt0_f = rearrange(grid_pt0_f, 'n h w c -> n c h w')
+        grid_pt0_f = grid_pt0_f.permute(0, 3, 1, 2)
         # 1. unfold(crop) all local windows
         if config.LOFTR.ALIGN_CORNER is False: # even windows
             assert W==8
             grid_pt0_f_unfold = F.unfold(grid_pt0_f, kernel_size=(W, W), stride=W, padding=0)
-        grid_pt0_f_unfold = rearrange(grid_pt0_f_unfold, 'n (c ww) l -> n l ww c', ww=W**2) # [1, hc0*wc0, W*W, 2]
-        grid_pt0_f_unfold = repeat(grid_pt0_f_unfold[0], 'l ww c -> N l ww c', N=N)
+        grid_pt0_f_unfold = grid_pt0_f_unfold.reshape(grid_pt0_f_unfold.shape[0], 2, W**2, -1).permute(0, 3, 2, 1)
+        grid_pt0_f_unfold = grid_pt0_f_unfold[0].unsqueeze(0).expand(N, -1, -1, -1)
 
         # 2. select only the predicted matches
         grid_pt0_f_unfold = grid_pt0_f_unfold[data['b_ids'], data['i_ids']]  # [m, ww, 2]
@@ -367,14 +367,12 @@ def get_warp_index(
     bs_grid_pt1 = bs_grid_pt1_c * s1[bs]
     n1 = len(bs_grid_pt1)
     n0 = len(bs_kpts0)
-    tomatch_pt1 = rearrange(
-        bs_grid_pt1.unsqueeze(1).repeat(1, n0, 1), "n1 n0 c -> (n1 n0) c"
-    )
-    tomatch_pt0 = rearrange(bs_kpts0.repeat(n1, 1, 1), "n1 n0 c -> (n1 n0) c")
+    tomatch_pt1 = bs_grid_pt1.unsqueeze(1).repeat(1, n0, 1).reshape(-1, bs_grid_pt1.shape[-1])
+    tomatch_pt0 = bs_kpts0.repeat(n1, 1, 1).reshape(-1, bs_kpts0.shape[-1])
     match_scores = symmetric_epipolar_distance(
         tomatch_pt1, tomatch_pt0, E_1to0[bs], K1[bs], K0[bs]
     )
-    v, ind = rearrange(match_scores, "(n1 n0) -> n1 n0", n1=n1, n0=n0).min(dim=1)
+    v, ind = match_scores.reshape(n1, n0).min(dim=1)
     del match_scores, tomatch_pt1, tomatch_pt0
     bs_w_pt1 = bs_kpts0[ind]
     bs_w_pt1_c_long = (bs_w_pt1 / s0[bs]).round().long()

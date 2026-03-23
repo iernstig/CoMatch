@@ -1,13 +1,15 @@
 import copy
+from collections import OrderedDict
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .linear_attention import Attention, crop_feature, pad_feature
-from einops.einops import rearrange
-from collections import OrderedDict
+from loguru import logger
+
 from ..utils.position_encoding import RoPEPositionEncodingSine
-import numpy as np
-from loguru import logger    
+from .linear_attention import Attention, crop_feature, pad_feature
+
 
 class AG_RoPE_EncoderLayer(nn.Module):
     def __init__(self,
@@ -74,9 +76,9 @@ class AG_RoPE_EncoderLayer(nn.Module):
             source_matchability_score_unfold = torch.softmax(source_matchability_score_unfold, dim=1) # [N, ww, L]
 
             source_unfold = F.unfold(source, kernel_size=(self.agg_size1, self.agg_size1), stride=self.agg_size1) # [N, wwC, L]
-            source_unfold = rearrange(source_unfold, 'n (c ww) l -> n c ww l', ww=self.agg_size1**2) # # [N, C, ww, L]
+            source_unfold = source_unfold.reshape(source_unfold.shape[0], C, self.agg_size1**2, -1)
             source_unfold = torch.sum(source_unfold * source_matchability_score_unfold.unsqueeze(1), dim=2) # [N, C, L]
-            weighted_source = rearrange(source_unfold, 'n c (h w) -> n c h w', h=H1//self.agg_size1, w=W1//self.agg_size1)
+            weighted_source = source_unfold.reshape(source_unfold.shape[0], C, H1 // self.agg_size1, W1 // self.agg_size1)
             query, source = self.norm1(self.aggregate(x * x_matchability_score).permute(0,2,3,1)), self.norm1(weighted_source.permute(0,2,3,1)) # [N, H, W, C]
 
         if x_mask is not None:
@@ -99,7 +101,7 @@ class AG_RoPE_EncoderLayer(nn.Module):
         m = self.merge(m.reshape(bs, -1, self.nhead*self.dim)) # [N, L, C]
 
         # Upsample feature
-        m = rearrange(m, 'b (h w) c -> b c h w', h=H0 // self.agg_size0, w=W0 // self.agg_size0) # [N, C, H0, W0]
+        m = m.reshape(bs, H0 // self.agg_size0, W0 // self.agg_size0, -1).permute(0, 3, 1, 2)
         if self.agg_size0 != 1:
             m = torch.nn.functional.interpolate(m, scale_factor=self.agg_size0, mode='bilinear', align_corners=False) # [N, C, H0, W0]
 

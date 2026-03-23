@@ -1,5 +1,14 @@
 import torch
-from kornia.geometry.epipolar import  numeric
+
+
+def _cross_product_matrix(v):
+    zeros = torch.zeros_like(v[..., 0])
+    vx, vy, vz = v[..., 0], v[..., 1], v[..., 2]
+    return torch.stack([
+        torch.stack([zeros, -vz, vy], dim=-1),
+        torch.stack([vz, zeros, -vx], dim=-1),
+        torch.stack([-vy, vx, zeros], dim=-1),
+    ], dim=-2)
 
 @torch.no_grad()
 def skew(v):
@@ -12,7 +21,7 @@ def skew(v):
 @torch.no_grad()
 def pose2fundamental(K0, K1, T_0to1):
     # pdb.set_trace()
-    Tx = numeric.cross_product_matrix(T_0to1[:, :3, 3])
+    Tx = _cross_product_matrix(T_0to1[:, :3, 3])
     E_mat = Tx @ T_0to1[:, :3, :3]
     # F = torch.inverse(K1).T @ R0to1 @ K0.T @ skew((K0 @ R0to1.T).dot(t0to1.reshape(3,)))
     # F_mat = torch.inverse(K1).T @ E_mat @ torch.inverse(K0)
@@ -24,7 +33,7 @@ def pose2fundamental(K0, K1, T_0to1):
 @torch.no_grad()
 def pose2essential_fundamental(K0, K1, T_0to1):
     # pdb.set_trace()
-    Tx = numeric.cross_product_matrix(T_0to1[:, :3, 3])
+    Tx = _cross_product_matrix(T_0to1[:, :3, 3])
     E_mat = Tx @ T_0to1[:, :3, :3]
     F_mat = torch.inverse(K1).transpose(1, 2) @ E_mat @ torch.inverse(K0)
     return E_mat, F_mat

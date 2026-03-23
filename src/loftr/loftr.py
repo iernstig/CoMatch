@@ -1,14 +1,17 @@
 import torch
 import torch.nn as nn
-from einops.einops import rearrange
+from loguru import logger
 
+from ..utils.misc import detect_NaN
 from .backbone import build_backbone
-from .loftr_module import LocalFeatureTransformer, FinePreprocess, LocalFeatureTransformer_loftr
+from .loftr_module import (
+    FinePreprocess,
+    LocalFeatureTransformer,
+    LocalFeatureTransformer_loftr,
+)
 from .utils.coarse_matching import CoarseMatching
 from .utils.fine_matching_epipolar import FineMatching
-from ..utils.misc import detect_NaN
 
-from loguru import logger
 
 class LoFTR(nn.Module):
     def __init__(self, config, profiler=None):
@@ -86,8 +89,8 @@ class LoFTR(nn.Module):
 
        
         
-        feat_c0 = rearrange(feat_c0, 'n c h w -> n (h w) c')
-        feat_c1 = rearrange(feat_c1, 'n c h w -> n (h w) c')
+        feat_c0 = feat_c0.flatten(2).transpose(1, 2)
+        feat_c1 = feat_c1.flatten(2).transpose(1, 2)
         
         # detect NaN during mixed precision training
         if self.config['replace_nan'] and (torch.any(torch.isnan(feat_c0)) or torch.any(torch.isnan(feat_c1))):

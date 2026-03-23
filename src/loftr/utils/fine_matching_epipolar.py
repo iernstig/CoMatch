@@ -1,12 +1,35 @@
 import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from kornia.geometry.subpix import dsnt
-from kornia.utils.grid import create_meshgrid
-
 from loguru import logger
+
+
+def _create_meshgrid(height, width, device, dtype, normalized_coordinates):
+    if normalized_coordinates:
+        xs = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
+        ys = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
+    else:
+        xs = torch.arange(width, device=device, dtype=dtype)
+        ys = torch.arange(height, device=device, dtype=dtype)
+
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+    return torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)
+
+
+def _spatial_expectation2d(heatmap, normalized_coordinates):
+    _, height, width = heatmap.shape
+    grid = _create_meshgrid(
+        height,
+        width,
+        device=heatmap.device,
+        dtype=heatmap.dtype,
+        normalized_coordinates=normalized_coordinates,
+    ).reshape(1, height * width, 2)
+    probs = heatmap.reshape(heatmap.shape[0], height * width, 1)
+    return torch.sum(probs * grid, dim=1)
+
 
 class FineMatching(nn.Module):
     """FineMatching with s2d paradigm"""
@@ -78,7 +101,7 @@ class FineMatching(nn.Module):
         idx_r_iids, idx_r_jids = idx_r // W, idx_r % W
         m_ids, idx_l_iids, idx_l_jids, idx_r_iids, idx_r_jids = m_ids.reshape(-1), idx_l_iids.reshape(-1), idx_l_jids.reshape(-1), idx_r_iids.reshape(-1), idx_r_jids.reshape(-1)
 
-        delta = create_meshgrid(3, 3, True, softmax_matrix_f.device).to(torch.long) # [1, 3, 3, 2]
+        delta = _create_meshgrid(3, 3, softmax_matrix_f.device, torch.float32, True).to(torch.long)
        
         m_ids = m_ids[...,None,None].expand(-1, 3, 3)
 
@@ -100,8 +123,8 @@ class FineMatching(nn.Module):
         # compute second-stage heatmap
         feat_ff0 = feat_ff0.reshape(M, self.W+2, self.W+2, self.local_regress_slicedim)
         feat_ff1 = feat_ff1.reshape(M, self.W+2, self.W+2, self.local_regress_slicedim)
-        feat_ff0 = feat_ff0[m_ids, idx_l_iids, idx_l_jids].view(-1, 9, self.local_regress_slicedim)
-        feat_ff1 = feat_ff1[m_ids, idx_r_iids, idx_r_jids].view(-1, 9, self.local_regress_slicedim)
+        feat_ff0 = feat_ff0[m_ids, idx_l_iids, idx_l_jids].reshape(-1, 9, self.local_regress_slicedim)
+        feat_ff1 = feat_ff1[m_ids, idx_r_iids, idx_r_jids].reshape(-1, 9, self.local_regress_slicedim)
 
         feat_ff0_picked = feat_ff0_picked = feat_ff0[:, 9//2, :]
         feat_ff1_picked = feat_ff1_picked = feat_ff1[:, 9//2, :]
@@ -118,8 +141,8 @@ class FineMatching(nn.Module):
         heatmap1 = conf_matrix_ff1.reshape(-1, 3, 3)
 
         # compute coordinates from heatmap
-        coords_normalized0 = dsnt.spatial_expectation2d(heatmap0[None], True)[0]
-        coords_normalized1 = dsnt.spatial_expectation2d(heatmap1[None], True)[0]
+        coords_normalized0 = _spatial_expectation2d(heatmap0, True)
+        coords_normalized1 = _spatial_expectation2d(heatmap1, True)
         
         if data['bs'] == 1:
             scale0 = scale * data['scale0'] if 'scale0' in data else scale
@@ -159,9 +182,9 @@ class FineMatching(nn.Module):
         data.update({'idx_l': idx_l, 'idx_r': idx_r})
 
         if self.fp16:
-            grid = create_meshgrid(W, W, False, conf_matrix.device, dtype=torch.float16) - W // 2 + 0.5 # kornia >= 0.5.1
+            grid = _create_meshgrid(W, W, conf_matrix.device, torch.float16, False) - W // 2 + 0.5
         else:
-            grid = create_meshgrid(W, W, False, conf_matrix.device) - W // 2 + 0.5
+            grid = _create_meshgrid(W, W, conf_matrix.device, conf_matrix.dtype, False) - W // 2 + 0.5
         grid = grid.reshape(1, -1, 2).expand(m, -1, -1)
         delta_l = torch.gather(grid, 1, idx_l.unsqueeze(-1).expand(-1, -1, 2))
         delta_r = torch.gather(grid, 1, idx_r.unsqueeze(-1).expand(-1, -1, 2))
