@@ -89,12 +89,8 @@ class CoarseMatching(nn.Module):
         self.train_coarse_percent = config['train_coarse_percent']
         self.train_pad_num_gt_min = config['train_pad_num_gt_min']
 
-    def _apply_dual_softmax(self, sim_matrix, softmax_mode):
-        if softmax_mode == 'log_softmax':
-            return torch.exp(F.log_softmax(sim_matrix, dim=1) + F.log_softmax(sim_matrix, dim=2))
-        if softmax_mode == 'softmax':
-            return F.softmax(sim_matrix, dim=1) * F.softmax(sim_matrix, dim=2)
-        raise ValueError(f"Unsupported coarse softmax mode: {softmax_mode}")
+    def _apply_dual_softmax(self, sim_matrix):
+        return F.softmax(sim_matrix, dim=1) * F.softmax(sim_matrix, dim=2)
 
     def forward(self, feat_c0, feat_c1, data, mask_c0=None, mask_c1=None):
         """
@@ -117,7 +113,6 @@ class CoarseMatching(nn.Module):
         """
         N, L, S, C = feat_c0.size(0), feat_c0.size(1), feat_c1.size(1), feat_c0.size(2)
         profile_enabled = data.get('_profile_coarse_matching', False)
-        softmax_mode = data.get('_coarse_softmax_mode', 'softmax')
         timings = {}
         device = feat_c0.device
 
@@ -181,10 +176,10 @@ class CoarseMatching(nn.Module):
             if profile_enabled:
                 sim_matrix, timings['softmax'] = _time_block(
                     device,
-                    lambda: self._apply_dual_softmax(sim_matrix, softmax_mode),
+                    lambda: self._apply_dual_softmax(sim_matrix),
                 )
             else:
-                sim_matrix = self._apply_dual_softmax(sim_matrix, softmax_mode)
+                sim_matrix = self._apply_dual_softmax(sim_matrix)
        
         
         data.update({'conf_matrix': sim_matrix})

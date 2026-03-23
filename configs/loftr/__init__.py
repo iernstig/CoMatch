@@ -1,0 +1,1 @@
+"""LoFTR configuration presets for CoMatch."""

@@ -9,10 +9,8 @@ import numpy as np
 import torch
 from matplotlib.lines import Line2D
 
-from src.config.default import get_cfg_defaults
-from src.loftr import LoFTR
+from comatch import CoMatchMatcher
 from src.loftr.loftr_module.linear_attention import Attention
-from src.utils.misc import lower_config
 
 
 def parse_args():
@@ -97,44 +95,11 @@ def parse_args():
         help="Disable mixed precision during inference timing and forward passes.",
     )
     parser.add_argument(
-        "--coarse-softmax-mode",
-        choices=["softmax", "log_softmax"],
-        default="log_softmax",
-        help="Dual-softmax implementation used inside coarse matching.",
-    )
-    parser.add_argument(
         "--compile-coarse-matching",
         action="store_true",
         help="Compile the coarse matching module with torch.compile using dynamic shapes.",
     )
     return parser.parse_args()
-
-
-def load_gray_image(path: Path, long_side: int):
-    image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-    if image is None:
-        raise FileNotFoundError(f"Could not read image: {path}")
-
-    height, width = image.shape
-    crop_size = min(height, width)
-    top = (height - crop_size) // 2
-    left = (width - crop_size) // 2
-    image = image[top:top + crop_size, left:left + crop_size]
-    image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-
-    height, width = image.shape
-    scale = long_side / max(height, width)
-    resized_width = int(round(width * scale))
-    resized_height = int(round(height * scale))
-
-    resized_width = max(32, (resized_width // 32) * 32)
-    resized_height = max(32, (resized_height // 32) * 32)
-
-    image = cv2.resize(image, (resized_width, resized_height))
-    tensor = torch.from_numpy(image).float()[None][None] / 255.0
-    return image, tensor
-
-
 def save_covis(gray_image: np.ndarray, score_map: torch.Tensor, output_path: Path):
     score = score_map.detach().float().cpu().numpy().astype(np.float32, copy=False)
     score = cv2.resize(score, (gray_image.shape[1], gray_image.shape[0]))
@@ -246,11 +211,10 @@ def _autocast_context(device, enabled):
     return torch.autocast(device_type="cuda", enabled=enabled)
 
 
-def _run_full_matcher(model, image0, image1, device, use_amp, coarse_softmax_mode):
+def _run_full_matcher(model, image0, image1, device, use_amp):
     batch = {
         "image0": image0,
         "image1": image1,
-        "_coarse_softmax_mode": coarse_softmax_mode,
     }
     with _autocast_context(device, use_amp):
         model(batch)
@@ -279,7 +243,7 @@ def _time_block(device, fn):
     return result, elapsed_ms
 
 
-def _profile_forward_stages(model, image0, image1, device, use_amp, coarse_softmax_mode):
+def _profile_forward_stages(model, image0, image1, device, use_amp):
     with _autocast_context(device, use_amp):
         data = {
             "image0": image0,
@@ -288,7 +252,6 @@ def _profile_forward_stages(model, image0, image1, device, use_amp, coarse_softm
             "hw0_i": image0.shape[2:],
             "hw1_i": image1.shape[2:],
             "_profile_coarse_matching": True,
-            "_coarse_softmax_mode": coarse_softmax_mode,
         }
 
         total_start = time.perf_counter()
@@ -394,32 +357,26 @@ def _maybe_compile_coarse_matching(model, enabled):
 def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    cfg = get_cfg_defaults()
-    cfg.merge_from_file(str(args.main_cfg_path))
-    cfg.LOFTR.COARSE.NPE = [832, 832, args.long_side, args.long_side]
-    cfg.LOFTR.COARSE.NO_FLASH = False
-    cfg.LOFTR.HALF = False
-    cfg.LOFTR.MP = not args.disable_amp
-
-    use_amp = device.type == "cuda" and cfg.LOFTR.MP
-
-    model = LoFTR(config=lower_config(cfg)["loftr"]).to(device)
-    state = torch.load(str(args.ckpt_path), map_location="cpu", weights_only=False)["state_dict"]
-    model.load_state_dict(state, strict=True)
-    model.eval()
+    matcher = CoMatchMatcher(
+        args.ckpt_path,
+        device=None,
+        long_side=args.long_side,
+        use_amp=not args.disable_amp,
+        config_path=args.main_cfg_path,
+        enable_flash=True,
+    )
+    device = matcher.device
+    use_amp = matcher.use_amp
+    model = matcher.model
     coarse_compile_enabled, coarse_compile_error = _maybe_compile_coarse_matching(model, args.compile_coarse_matching)
     attention_status = _attention_status(model)
 
-    gray0, image0 = load_gray_image(args.image0, args.long_side)
-    gray1, image1 = load_gray_image(args.image1, args.long_side)
-    image0 = image0.to(device)
-    image1 = image1.to(device)
+    gray0, image0 = matcher.prepare_image(args.image0)
+    gray1, image1 = matcher.prepare_image(args.image1)
 
     with torch.inference_mode():
         for _ in range(args.warmup_iters):
-            _run_full_matcher(model, image0, image1, device, use_amp, args.coarse_softmax_mode)
+            _run_full_matcher(model, image0, image1, device, use_amp)
 
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -427,17 +384,17 @@ def main():
             end_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
             for _ in range(args.timed_iters):
-                _run_full_matcher(model, image0, image1, device, use_amp, args.coarse_softmax_mode)
+                _run_full_matcher(model, image0, image1, device, use_amp)
             end_event.record()
             torch.cuda.synchronize()
             inference_ms = start_event.elapsed_time(end_event) / max(args.timed_iters, 1)
         else:
             start_time = time.perf_counter()
             for _ in range(args.timed_iters):
-                _run_full_matcher(model, image0, image1, device, use_amp, args.coarse_softmax_mode)
+                _run_full_matcher(model, image0, image1, device, use_amp)
             inference_ms = ((time.perf_counter() - start_time) * 1000.0) / max(args.timed_iters, 1)
 
-        batch, stage_timings_ms = _profile_forward_stages(model, image0, image1, device, use_amp, args.coarse_softmax_mode)
+        batch, stage_timings_ms = _profile_forward_stages(model, image0, image1, device, use_amp)
 
     mkpts0_f = batch["mkpts0_f"].detach().cpu().numpy()
     mkpts1_f = batch["mkpts1_f"].detach().cpu().numpy()
@@ -469,7 +426,6 @@ def main():
     print("input resolution image1:", f"{gray1.shape[1]}x{gray1.shape[0]}")
     print("mixed precision:", use_amp)
     print("flash attention status:", attention_status)
-    print("coarse softmax mode:", args.coarse_softmax_mode)
     print("compile coarse matching:", coarse_compile_enabled)
     if coarse_compile_error is not None:
         print("compile coarse matching error:", coarse_compile_error)

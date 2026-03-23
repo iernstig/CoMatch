@@ -43,6 +43,46 @@ conda activate comatch
 pip install torch==2.0.0+cu118 --index-url https://download.pytorch.org/whl/cu118
 pip install -r requirements.txt 
 ```
+
+### Use as a dependency
+You can also install CoMatch directly into another project:
+
+```shell
+uv add git+https://github.com/iernstig/CoMatch.git
+```
+
+Then use the public inference API:
+
+```python
+from comatch import CoMatchMatcher, match_batch, match_images
+
+matcher = CoMatchMatcher("/path/to/comatch_outdoor.ckpt")
+result = matcher.match_images(img_a, img_b)
+
+print(result.mkpts0.shape)
+print(result.mkpts1.shape)
+print(result.confidence.shape)
+print(result.covis0.shape)
+print(result.covis1.shape)
+
+# Or use the convenience function.
+result = match_images(
+  img_a,
+  img_b,
+  checkpoint_path="/path/to/comatch_outdoor.ckpt",
+)
+
+# For many matches, pass a shared image array and pair indices.
+batch_results = match_batch(
+  [img_a, img_b, img_c],
+  [(0, 1), (0, 2), (1, 2)],
+  checkpoint_path="/path/to/comatch_outdoor.ckpt",
+)
+```
+
+`img_a` and `img_b` may be file paths, PIL images, NumPy arrays, or torch tensors.
+The returned covisibility maps are normalized float arrays aligned with the preprocessed images.
+
 The test and training can be downloaded by [download link](https://drive.google.com/drive/folders/1DOcOPZb3-5cWxLqn256AhwUVjBPifhuf?usp=sharing) provided by LoFTR
 
 We provide our pre-trained model in [download link](https://drive.google.com/file/d/1DHd7LZtNH1vwhoTUA8a8nVIiIpx-38RX/view?usp=sharing)
