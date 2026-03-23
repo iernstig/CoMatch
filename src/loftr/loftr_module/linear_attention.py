@@ -3,16 +3,29 @@ Linear Transformer proposed in "Transformers are RNNs: Fast Autoregressive Trans
 Modified from: https://github.com/idiap/fast-transformers/blob/master/fast_transformers/attention/linear_attention.py
 """
 
+from contextlib import nullcontext
+
 import torch
-from torch.nn import Module
 import torch.nn.functional as F
-from einops.einops import rearrange
+from torch.nn import Module
 
 if hasattr(F, 'scaled_dot_product_attention'):
     FLASH_AVAILABLE = True
-    from torch.backends.cuda import sdp_kernel
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        def _flash_kernel_context():
+            return sdpa_kernel(SDPBackend.FLASH_ATTENTION)
+    except ImportError:
+        from torch.backends.cuda import sdp_kernel
+
+        def _flash_kernel_context():
+            return sdp_kernel(enable_math=False, enable_flash=True, enable_mem_efficient=False)
 else:
     FLASH_AVAILABLE = False
+
+    def _flash_kernel_context():
+        return nullcontext()
 
 def crop_feature(query, key, value, x_mask, source_mask):
     mask_h0, mask_w0, mask_h1, mask_w1 = x_mask[0].sum(-2)[0], x_mask[0].sum(-1)[0], source_mask[0].sum(-2)[0], source_mask[0].sum(-1)[0]
@@ -34,7 +47,6 @@ class Attention(Module):
     def __init__(self, no_flash=False, nhead=8, dim=256, fp32=False):
         super().__init__()
         self.flash = FLASH_AVAILABLE and not no_flash
-        print(self.flash)
         self.nhead = nhead
         self.dim = dim
         self.fp32 = fp32
@@ -43,7 +55,7 @@ class Attention(Module):
         assert q_mask is None and kv_mask is None, "Not support generalized attention mask yet."
         if self.flash and not self.fp32:
             args = [x.contiguous() for x in [query, key, value]]
-            with sdp_kernel(enable_math= False, enable_flash= True, enable_mem_efficient= False):
+            with _flash_kernel_context():
                 out = F.scaled_dot_product_attention(*args)
         elif self.flash:
             args = [x.contiguous() for x in [query, key, value]]
@@ -63,14 +75,22 @@ class Attention(Module):
             query, key, value, mask_h0, mask_w0 = crop_feature(query, key, value, q_mask, kv_mask)
 
         if self.flash:
-            query, key, value = map(lambda x: rearrange(x, 'n h w (nhead d) -> n nhead (h w) d', nhead=self.nhead, d=self.dim), [query, key, value])
+            query, key, value = map(
+                lambda x: x.reshape(x.shape[0], x.shape[1], x.shape[2], self.nhead, self.dim)
+                .permute(0, 3, 1, 2, 4)
+                .reshape(x.shape[0], self.nhead, x.shape[1] * x.shape[2], self.dim),
+                [query, key, value],
+            )
         else:
-            query, key, value = map(lambda x: rearrange(x, 'n h w (nhead d) -> n (h w) nhead d', nhead=self.nhead, d=self.dim), [query, key, value])
+            query, key, value = map(
+                lambda x: x.reshape(x.shape[0], x.shape[1] * x.shape[2], self.nhead, self.dim),
+                [query, key, value],
+            )
 
         m = self.attention(query, key, value, q_mask=None, kv_mask=None)
 
         if self.flash:
-            m = rearrange(m, 'n nhead L d -> n L nhead d', nhead=self.nhead, d=self.dim)
+            m = m.permute(0, 2, 1, 3)
 
         if q_mask is not None:
             m = pad_feature(m, mask_h0, mask_w0, q_mask)

@@ -1,12 +1,27 @@
+import time
+from contextlib import nullcontext
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops.einops import rearrange, repeat
-
 from loguru import logger
-import numpy as np
 
 INF = 1e9
+
+
+def _sync_if_needed(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+
+
+def _time_block(device, fn):
+    _sync_if_needed(device)
+    start_time = time.perf_counter()
+    result = fn()
+    _sync_if_needed(device)
+    elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+    return result, elapsed_ms
 
 def mask_border(m, b: int, v):
     """ Mask borders with value
@@ -74,6 +89,13 @@ class CoarseMatching(nn.Module):
         self.train_coarse_percent = config['train_coarse_percent']
         self.train_pad_num_gt_min = config['train_pad_num_gt_min']
 
+    def _apply_dual_softmax(self, sim_matrix, softmax_mode):
+        if softmax_mode == 'log_softmax':
+            return torch.exp(F.log_softmax(sim_matrix, dim=1) + F.log_softmax(sim_matrix, dim=2))
+        if softmax_mode == 'softmax':
+            return F.softmax(sim_matrix, dim=1) * F.softmax(sim_matrix, dim=2)
+        raise ValueError(f"Unsupported coarse softmax mode: {softmax_mode}")
+
     def forward(self, feat_c0, feat_c1, data, mask_c0=None, mask_c1=None):
         """
         Args:
@@ -94,40 +116,88 @@ class CoarseMatching(nn.Module):
             NOTE: M' != M during training.
         """
         N, L, S, C = feat_c0.size(0), feat_c0.size(1), feat_c1.size(1), feat_c0.size(2)
+        profile_enabled = data.get('_profile_coarse_matching', False)
+        softmax_mode = data.get('_coarse_softmax_mode', 'softmax')
+        timings = {}
+        device = feat_c0.device
 
         # normalize
         feat_c0, feat_c1 = map(lambda feat: feat / feat.shape[-1]**.5,
                                [feat_c0, feat_c1])
 
         if self.fp16matmul:
-            sim_matrix = torch.einsum("nlc,nsc->nls", feat_c0,
-                                    feat_c1) / self.temperature
-            del feat_c0, feat_c1
-            if mask_c0 is not None:
-                sim_matrix = sim_matrix.masked_fill(
-                    ~(mask_c0[..., None] * mask_c1[:, None]).bool(),
-                    -1e4
-                    )
-        else:
-            with torch.autocast(enabled=False, device_type='cuda'):
+            if profile_enabled:
+                sim_matrix, timings['similarity'] = _time_block(
+                    device,
+                    lambda: torch.einsum("nlc,nsc->nls", feat_c0, feat_c1) / self.temperature,
+                )
+            else:
                 sim_matrix = torch.einsum("nlc,nsc->nls", feat_c0,
                                         feat_c1) / self.temperature
+            del feat_c0, feat_c1
+            if mask_c0 is not None:
+                if profile_enabled:
+                    sim_matrix, timings['mask_fill'] = _time_block(
+                        device,
+                        lambda: sim_matrix.masked_fill(
+                            ~(mask_c0[..., None] * mask_c1[:, None]).bool(),
+                            -1e4,
+                        ),
+                    )
+                else:
+                    sim_matrix = sim_matrix.masked_fill(
+                        ~(mask_c0[..., None] * mask_c1[:, None]).bool(),
+                        -1e4
+                        )
+        else:
+            autocast_context = torch.autocast(enabled=False, device_type='cuda') if device.type == 'cuda' else nullcontext()
+            with autocast_context:
+                if profile_enabled:
+                    sim_matrix, timings['similarity'] = _time_block(
+                        device,
+                        lambda: torch.einsum("nlc,nsc->nls", feat_c0, feat_c1) / self.temperature,
+                    )
+                else:
+                    sim_matrix = torch.einsum("nlc,nsc->nls", feat_c0,
+                                            feat_c1) / self.temperature
                 del feat_c0, feat_c1
                 if mask_c0 is not None:
-                    sim_matrix = sim_matrix.float().masked_fill(
-                        ~(mask_c0[..., None] * mask_c1[:, None]).bool(),
-                        -INF
+                    if profile_enabled:
+                        sim_matrix, timings['mask_fill'] = _time_block(
+                            device,
+                            lambda: sim_matrix.float().masked_fill(
+                                ~(mask_c0[..., None] * mask_c1[:, None]).bool(),
+                                -INF,
+                            ),
                         )
+                    else:
+                        sim_matrix = sim_matrix.float().masked_fill(
+                            ~(mask_c0[..., None] * mask_c1[:, None]).bool(),
+                            -INF
+                            )
         if self.skip_softmax:
             sim_matrix = sim_matrix
         else:
-            sim_matrix = F.softmax(sim_matrix, 1) * F.softmax(sim_matrix, 2)
+            if profile_enabled:
+                sim_matrix, timings['softmax'] = _time_block(
+                    device,
+                    lambda: self._apply_dual_softmax(sim_matrix, softmax_mode),
+                )
+            else:
+                sim_matrix = self._apply_dual_softmax(sim_matrix, softmax_mode)
        
         
         data.update({'conf_matrix': sim_matrix})
 
         # predict coarse matches from conf_matrix
-        data.update(**self.get_coarse_match(sim_matrix, data))
+        if profile_enabled:
+            data['coarse_matching_profile_ms'] = timings
+            coarse_matches, get_match_ms = _time_block(device, lambda: self.get_coarse_match(sim_matrix, data))
+            timings['extract_matches'] = get_match_ms
+            data['coarse_matching_profile_ms'] = timings
+            data.update(**coarse_matches)
+        else:
+            data.update(**self.get_coarse_match(sim_matrix, data))
 
     @torch.no_grad()
     def get_coarse_match(self, conf_matrix, data):
@@ -152,30 +222,86 @@ class CoarseMatching(nn.Module):
             'w1c': data['hw1_c'][1]
         }
         _device = conf_matrix.device
+        profile_enabled = data.get('_profile_coarse_matching', False)
+        timings = data.get('coarse_matching_profile_ms') if profile_enabled else None
         # 1. confidence thresholding
-        mask = conf_matrix > self.thr
-        mask = rearrange(mask, 'b (h0c w0c) (h1c w1c) -> b h0c w0c h1c w1c',
-                         **axes_lengths)
+        if profile_enabled:
+            mask, timings['threshold'] = _time_block(device=_device, fn=lambda: conf_matrix > self.thr)
+            mask, timings['reshape_5d'] = _time_block(
+                device=_device,
+                fn=lambda: mask.reshape(
+                    mask.shape[0],
+                    axes_lengths['h0c'],
+                    axes_lengths['w0c'],
+                    axes_lengths['h1c'],
+                    axes_lengths['w1c'],
+                ),
+            )
+        else:
+            mask = conf_matrix > self.thr
+            mask = mask.reshape(
+                mask.shape[0],
+                axes_lengths['h0c'],
+                axes_lengths['w0c'],
+                axes_lengths['h1c'],
+                axes_lengths['w1c'],
+            )
 
         if 'mask0' not in data:
-            mask_border(mask, self.border_rm, False)
+            if profile_enabled:
+                _, timings['border_mask'] = _time_block(_device, lambda: mask_border(mask, self.border_rm, False))
+            else:
+                mask_border(mask, self.border_rm, False)
         else:
-            mask_border_with_padding(mask, self.border_rm, False,
-                                     data['mask0'], data['mask1'])
-        mask = rearrange(mask, 'b h0c w0c h1c w1c -> b (h0c w0c) (h1c w1c)',
-                         **axes_lengths)
+            if profile_enabled:
+                _, timings['border_mask'] = _time_block(
+                    _device,
+                    lambda: mask_border_with_padding(mask, self.border_rm, False, data['mask0'], data['mask1']),
+                )
+            else:
+                mask_border_with_padding(mask, self.border_rm, False,
+                                         data['mask0'], data['mask1'])
+        if profile_enabled:
+            mask, timings['reshape_3d'] = _time_block(
+                _device,
+                lambda: mask.reshape(
+                    mask.shape[0],
+                    axes_lengths['h0c'] * axes_lengths['w0c'],
+                    axes_lengths['h1c'] * axes_lengths['w1c'],
+                ),
+            )
+        else:
+            mask = mask.reshape(
+                mask.shape[0],
+                axes_lengths['h0c'] * axes_lengths['w0c'],
+                axes_lengths['h1c'] * axes_lengths['w1c'],
+            )
             
         # 2. mutual nearest
-        mask = mask \
-            * (conf_matrix == conf_matrix.max(dim=2, keepdim=True)[0]) \
-            * (conf_matrix == conf_matrix.max(dim=1, keepdim=True)[0])
+        if profile_enabled:
+            row_max, timings['row_max'] = _time_block(_device, lambda: conf_matrix.max(dim=2, keepdim=True)[0])
+            col_max, timings['col_max'] = _time_block(_device, lambda: conf_matrix.max(dim=1, keepdim=True)[0])
+            mask, timings['mutual_nearest'] = _time_block(
+                _device,
+                lambda: mask * (conf_matrix == row_max) * (conf_matrix == col_max),
+            )
+        else:
+            mask = mask \
+                * (conf_matrix == conf_matrix.max(dim=2, keepdim=True)[0]) \
+                * (conf_matrix == conf_matrix.max(dim=1, keepdim=True)[0])
 
         # 3. find all valid coarse matches
         # this only works when at most one `True` in each row
-        mask_v, all_j_ids = mask.max(dim=2)
-        b_ids, i_ids = torch.where(mask_v)
-        j_ids = all_j_ids[b_ids, i_ids]
-        mconf = conf_matrix[b_ids, i_ids, j_ids]
+        if profile_enabled:
+            (mask_v, all_j_ids), timings['mask_reduce'] = _time_block(_device, lambda: mask.max(dim=2))
+            (b_ids, i_ids), timings['where'] = _time_block(_device, lambda: torch.where(mask_v))
+            j_ids, timings['gather_j_ids'] = _time_block(_device, lambda: all_j_ids[b_ids, i_ids])
+            mconf, timings['gather_conf'] = _time_block(_device, lambda: conf_matrix[b_ids, i_ids, j_ids])
+        else:
+            mask_v, all_j_ids = mask.max(dim=2)
+            b_ids, i_ids = torch.where(mask_v)
+            j_ids = all_j_ids[b_ids, i_ids]
+            mconf = conf_matrix[b_ids, i_ids, j_ids]
 
         # 4. Random sampling of training samples for fine-level LoFTR
         # (optional) pad samples with gt coarse-level matches
@@ -225,12 +351,26 @@ class CoarseMatching(nn.Module):
 
         scale0 = scale * data['scale0'][b_ids] if 'scale0' in data else scale
         scale1 = scale * data['scale1'][b_ids] if 'scale1' in data else scale
-        mkpts0_c = torch.stack(
-            [i_ids % data['hw0_c'][1], i_ids // data['hw0_c'][1]],
-            dim=1) * scale0 
-        mkpts1_c = torch.stack(
-            [j_ids % data['hw1_c'][1], j_ids // data['hw1_c'][1]],
-            dim=1) * scale1 
+        if profile_enabled:
+            mkpts0_c, timings['decode_mkpts0'] = _time_block(
+                _device,
+                lambda: torch.stack(
+                    [i_ids % data['hw0_c'][1], i_ids // data['hw0_c'][1]],
+                    dim=1) * scale0,
+            )
+            mkpts1_c, timings['decode_mkpts1'] = _time_block(
+                _device,
+                lambda: torch.stack(
+                    [j_ids % data['hw1_c'][1], j_ids // data['hw1_c'][1]],
+                    dim=1) * scale1,
+            )
+        else:
+            mkpts0_c = torch.stack(
+                [i_ids % data['hw0_c'][1], i_ids // data['hw0_c'][1]],
+                dim=1) * scale0 
+            mkpts1_c = torch.stack(
+                [j_ids % data['hw1_c'][1], j_ids // data['hw1_c'][1]],
+                dim=1) * scale1 
 
         m_bids = b_ids[mconf != 0]        
         # These matches is the current prediction (for visualization)
